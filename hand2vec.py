@@ -11,10 +11,14 @@ or ranking of distributions ?
 
 import re
 import codecs
-import csv
+import string
+import json
+from copy import deepcopy
 
 
 PLAYER = 'jaimestaples'
+
+STAGES = ['HOLE CARDS', 'FLOP','TURN','RIVER',]#'SHOW DOWN']
 
 POSITIONS = ['btn','sb','bb','utg','ep','emp','mp','hjck','co']
 
@@ -23,26 +27,17 @@ CARDS = ['As','Ks','Qs','Js','Ts','9s','8s','7s','6s','5s','4s','3s','2s',
          'Ad','Kd','Qd','Jd','Td','9d','8d','7d','6d','5d','4d','3d','2d',
          'Ac','Kc','Qc','Jc','Tc','9c','8c','7c','6c','5c','4c','3c','2c',]
 
-
-def flatten(dictionary, parent_keys=[]):
-    """
-        http://stackoverflow.com/questions/6027558/flatten-nested-python-dictionaries-compressing-keys
-    """
-    items = []
-    for k,v in dictionary.items():
-        if issubclass(v.__class__,dict):
-            items.extend(flatten(v,parent_keys+[k]).items())
-        else:
-            if parent_keys:
-                items.append(('{}_{}'.format('_'.join(parent_keys),k),v))
-            else:
-                items.append((k,v))
-    return dict(items)
-
-# class Hand(list):
-#     """
-
-#     """
+IGNORE_RE = '|'.join(['has timed out',
+          'is disconnected',
+          'is connected',
+          'is sitting out',
+          'has returned',
+          '.+ said, ".*"',
+          're-buys and receives',
+          'takes the add-on and receives',
+          'collected \d+ from pot',
+          'doesn\'t show hand',
+          'adds \d+ chips'])
 
 class Gamestate(dict):
     """
@@ -56,6 +51,7 @@ class Gamestate(dict):
 
         self['tournament_id'] = 0
         self['hand_id'] = 0
+        self['hole_cards'] = Deck()
         self['community_cards'] = Deck()
         self['ante'] = 0
         self['small_blind'] = 0
@@ -78,16 +74,13 @@ class Seatstate(dict):
         super(Seatstate, self).__init__()
 
         self['player'] = 0
-        self['ante'] = 0
         self['posts'] = 0
         self['folds'] = 0
         self['checks'] = 0
         self['bets'] = 0
         self['calls'] = 0
         self['raises'] = 0
-        # self['collected'] = 0
         self['chips'] = 0
-        self['cards'] = Deck()
 
         for k in kwargs:
             self[k] = kwargs[k]
@@ -104,14 +97,50 @@ class Deck(dict):
         for k in kwargs:
             self[k] = kwargs[k]
 
-def write_gamestates_to_csv(gamestates, out='out.csv'):
+def write_gamestates_to_csv(gamestates, filename):
 
-    with open(out, 'wb') as outfile:
-
-        dw = csv.DictWriter(outfile, flatten(Gamestate()).keys())
+    with codecs.open(filename, 'wb') as f:
+        dw = csv.DictWriter(f, flatten(Gamestate()).keys())
         dw.writeheader()
         for gs in gamestates:
-            dw.writerow(flatten(gs))
+            try:
+                dw.writerow(flatten(gs))
+            except UnicodeEncodeError:
+                safe = {}
+                flat = flatten(gs)
+                for k in flat:
+                    if type(flat[k]) == unicode:
+                        safe[k] = flat[k].encode('ascii', errors='ignore')
+                    else:
+                        safe[k] = flat[k]
+                dw.writerow(safe)
+
+def write_gamestates_to_json(gamestates, filename):
+
+    with open(filename, 'wb')
+
+def flatten(dictionary, parent_keys=[]):
+    """
+        http://stackoverflow.com/questions/6027558/flatten-nested-python-dictionaries-compressing-keys
+    """
+    items = []
+    for k,v in dictionary.items():
+        if issubclass(v.__class__,dict):
+            items.extend(flatten(v,parent_keys+[k]).items())
+        else:
+            if parent_keys:
+                items.append(('{}_{}'.format('_'.join(parent_keys),k),v))
+            else:
+                items.append((k,v))
+    return dict(items)
+
+def flat_sparsify(dictionary):
+    """
+        remove all 0 entries from a flattened dictionary
+    """
+    
+    return {k : v for k,v in dictionary.items() if v != 0}   
+
 
 def get_hands(hh_file):
     """
@@ -160,197 +189,124 @@ def get_next_hand(lines):
 
     gamestates = []
 
-    gs, player_pos = get_initial_gamestate(lines)
+    gs, player_pos, line = get_initial_gamestate(lines)
     if not gs:
         return gamestates
 
-## here is the first gamestate we yield
-## ante
-    if gs['ante']:
-        for p in POSITIONS:
-            gs[p]['antes'] = gs['ante']            
-            # yield gs
-            gamestates.append(gs)
-            gs[p]['antes'] = 0
+    print gs['hand_id']
 
-## small blind
-    gs['sb']['posts'] = gs['small_blind']
-    gs['sb']['chips'] -= gs['small_blind']
-    # yield gs
-    gamestates.append(gs)
-    gs['sb']['posts'] = 0
-
-## big blind
-    gs['bb']['posts'] = gs['big_blind']
-    gs['bb']['chips'] -= gs['big_blind']
-    # yield gs
-    gamestates.append(gs)
-    gs['bb']['posts'] = 0
-
-## skip  a line for the big blind
-    line = lines.next().strip()
-## hole cards                
-    line = lines.next().strip()
-    assert line == '*** HOLE CARDS ***'
-    line = lines.next().strip()
-
-    player = line.split(' [')[0][len('Dealt to '):]
-    card1, card2 = line.split(' [')[-1][:-1].split()
-    gs[player_pos[player]]['cards'][card1] = 1
-    gs[player_pos[player]]['cards'][card2] = 1
-    # yield gs
-    gamestates.append(gs)
-
-## preflop action
-    line = lines.next().strip()
-    while not re.match('\*\*\* FLOP \*\*\*|Uncalled', line):
-## e.g.
-## H0RRoR_RiVeR: raises 40 to 60
-        player, action, amount = get_player_action_amount(line)
-        gs[player_pos[player]][action] = amount
-        # yield gs
-        gamestates.append(gs)
-        gs[player_pos[player]][action] = 0
-
-        line = lines.next().strip()
-
-## everybody folded
-    if re.match('Uncalled', line):
-        end_of_hand(lines)
-        return gamestates
-## flop
-## e.g.
-## *** FLOP *** [Td 3d 4d]
-    card1, card2, card3 = line.split(' [')[-1][:-1].split()
-    gs['community_cards'][card1] = 1
-    gs['community_cards'][card2] = 1
-    gs['community_cards'][card3] = 1
-    # yield gs
-    gamestates.append(gs)
-
-## flop action                
-    line = lines.next().strip()
-    while not re.match('\*\*\* TURN \*\*\*|Uncalled', line):
-        player, action, amount = get_player_action_amount(line)
-        gs[player_pos[player]][action] = amount
-        # yield gs
-        gamestates.append(gs)
-        gs[player_pos[player]][action] = 0
-
-        line = lines.next().strip()
-
-## everybody folded
-    if re.match('Uncalled', line):
-        end_of_hand(lines)                  
-        return gamestates
-## turn
-## e.g. 
-## *** TURN *** [Td 3d 4d] [Tc]
-    gs['community_cards'][line.split('] [')[-1][:-1]] = 1
-    # yield gs
-    gamestates.append(gs)    
-
-## turn action                
-    line = lines.next().strip()
-    while not re.match('\*\*\* RIVER \*\*\*|Uncalled', line):
-        player, action, amount = get_player_action_amount(line)
-        gs[player_pos[player]][action] = amount
-        # yield gs
-        gamestates.append(gs)
-        gs[player_pos[player]][action] = 0
-
-        line = lines.next().strip()
-
-## everybody folded
-    if re.match('Uncalled', line):
-        end_of_hand(lines)                    
-        return gamestates
-## river
-## e.g. 
-##*** RIVER *** [Kd 4s Ts 5h] [Ah]
-    gs['community_cards'][line.split('] [')[-1][:-1]] = 1
-    # yield gs
-    gamestates.append(gs)
-
-## river action                
-    line = lines.next().strip()
-    while not re.match('\*\*\* SHOW DOWN \*\*\*|Uncalled', line):
-        player, action, amount = get_player_action_amount(line)
-        gs[player_pos[player]][action] = amount
-        # yield gs
-        gamestates.append(gs)
-        gs[player_pos[player]][action] = 0
+## action preflop and on each street
+    for stage in STAGES:
+        # print stage
+        while(True):
+            # print line
+            if re.match('\*\*\* {} \*\*\*'.format(stage), line):
+## we reached the next stage at which cards are dealt
+## go to next stage in outer loop                
+                break
+            elif re.match('Uncalled bet|\*\*\* SUMMARY \*\*\*', line):
+## the hand is over                
+                end_of_hand(lines)
+                return gamestates
+            else:
+                if re.search(IGNORE_RE, line):
+                    line = lines.next().strip()
+                    continue
+                player, action, amount = get_player_action_amount(line)
+                gs[player_pos[player]][action] = amount
+                if action in ['bets','raises','calls','posts']:
+                    gs[player_pos[player]]['chips'] -= amount
+                gamestates.append(deepcopy(gs))
+## why doesn't this work?                
+                # gamestates.append(Gamestate(**gs))
+                gs[player_pos[player]][action] = 0
+                line = lines.next().strip()
+## we broke out
+        if stage == 'HOLE CARDS':
+            line = lines.next().strip()
+            player = line.split(' [')[0][len('Dealt to '):]
+            card1, card2 = line.split(' [')[-1][:-1].split()
+            gs[player_pos[player]]['cards'][card1] = 1
+            gs[player_pos[player]]['cards'][card2] = 1
+            gamestates.append(deepcopy(gs))
+        if stage == 'FLOP':
+                card1, card2, card3 = line.split(' [')[-1][:-1].split()
+                gs['community_cards'][card1] = 1
+                gs['community_cards'][card2] = 1
+                gs['community_cards'][card3] = 1
+                gamestates.append(deepcopy(gs))
+        elif stage in ['TURN', 'RIVER']:
+            gs['community_cards'][line.split('] [')[-1][:-1]] = 1
+            gamestates.append(deepcopy(gs))
 
         line = lines.next().strip()
 
     return gamestates
-
 
 def get_initial_gamestate(lines):
 
 ## beginning of a new hand
     for line in lines:
         if re.match('PokerStars Hand #\d+', line):
-
             line = line.strip()
-
             gs = Gamestate()
-
 # hand_id = re.search('\d+', line).group()
             gs['hand_id'] = re.search('\d+', line).group()
             gs['tournament_id'] = re.search('Tournament #\d+',line).group()[len('Tournament #'):]
-
-## what does ante look like? this is broken only works for sb bb
+## blind levels
             blinds = re.search('Level .+ \(\d+/\d+\)', line).group()
             gs['small_blind'] = int(re.search('\(\d+', blinds).group()[1:])
             gs['big_blind'] = int(re.search('\d+\)', blinds).group()[:-1])
-
             line = lines.next().strip()
 ## get the number of seats at the table
             num_seats = int(re.search('\d+-max', line).group().replace('-max',''))
-
             if num_seats > 9:
                 raise Exception('too many players at the table')
-
 ## get the seat that has the button button
             button = int(re.search('Seat #\d is the button',
                                    line).group()[6])
-
 ## for convenient access to player positions
             player_pos = {}
-
-            line = lines.next().strip()
+## the players and the antes             
 ## get the players and chips for each seat                
 ## e.g.:
 ## Seat 1: liudasas (3125 in chips)
-            while re.match('Seat',line):
-
-                seat = (int(re.search('\d+', line).group()) - button) % 9
-## spaces in player names so have to be careful                    
-                gs[POSITIONS[seat]]['player'] = line.split(': ')[1].split(' (')[0]
-                gs[POSITIONS[seat]]['chips'] = int(re.search('\d+ in chips', line).group()[:-9])
-
-                player_pos[gs[POSITIONS[seat]]['player']] = POSITIONS[seat]
-
+            while (True):
                 line = lines.next().strip()
+                if re.match('Seat', line):
+                    seat = (int(re.search('\d+', line).group()) - button) % 9
+    ## spaces in player names so have to be careful                    
+                    gs[POSITIONS[seat]]['player'] = line[len('Seat N: '):].split(' (')[0]
+                    gs[POSITIONS[seat]]['chips'] = int(re.search('\d+ in chips', line).group()[:-9])
+                    player_pos[gs[POSITIONS[seat]]['player']] = POSITIONS[seat]
+                elif re.search(IGNORE_RE,line):
+                    continue
+                else:
+                    break
 
-            return gs, player_pos
+            return gs, player_pos, line
 ## no hands in input            
-    return None, None
-
+    return None, None, None
 
 def get_player_action_amount(line):
+    """
+        given a action containing a player gamestate update,
+        return the player, the action, and the amount
+    """
+    print line
     player = line.split(': ')[0]
     action = line.split(': ')[1].split()[0]
-    if action not in ['folds', 'checks']:
-        amount = int(line.split()[-1])
-    else:
+    if action in ['folds', 'checks']:
         amount = 1
-
+    else:
+        amount = int(line.replace(' and is all-in','').split()[-1])
+    
     return player, action, amount
 
 
 def end_of_hand(lines):
-    line = lines.next()
-    while line.strip() != '':
-        line = lines.next()
+    """
+        go to the next line of whitespace in lines
+    """   
+    while  lines.next().strip() != '':
+        continue
